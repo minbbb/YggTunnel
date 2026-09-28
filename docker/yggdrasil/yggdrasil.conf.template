@@ -1,0 +1,50 @@
+# Yggdrasil node configuration template.
+#
+# Rendered into /state/config.conf by the container entrypoint on every start,
+# substituting the __YGG_*__ placeholders with the values from .env. The private
+# key (/state/yggdrasil.key) is the one thing that is not re-created, which is
+# why the node keeps its address across restarts.
+#
+# Baked into the image and mounted over it by the compose files, so it stays
+# editable in the repository without a rebuild.
+#
+# Reference: https://yggdrasil-network.github.io/configurationref.html
+
+{
+  # In a file of its own rather than inlined, so the rendered config can be
+  # inspected without leaking the key. The key is the node's identity: both the
+  # IPv6 address and the routed /64 are derived from it.
+  PrivateKeyPath: "__YGG_STATE_DIR__/yggdrasil.key"
+
+  # The node needs peers to reach the network. The server is found through the
+  # DHT, so the two sides of the tunnel never peer with each other.
+  Peers: [ __YGG_PEERS__ ]
+
+  # No inbound peering listener: the server needs no open port and keeps working
+  # behind NAT. Peer discovery is meant for nodes on the same LAN and only
+  # produces noise inside a container bridge.
+  # Listen: []
+  MulticastInterfaces: []
+
+  # Closed overlay. Session traffic is only exchanged between nodes that share
+  # this value, so no other node on the public Yggdrasil network can reach the
+  # Shadowsocks port on the server even if it learns the server's address. It
+  # does not restrict peering, and third-party relay nodes still forward our
+  # traffic as usual.
+  GroupPassword: "__YGG_GROUP_PASSWORD__"
+
+  # UNIX socket rather than a TCP port: the Shadowsocks container shares this
+  # network namespace, and a socket file is not reachable from it.
+  # Query the node with ./scripts/yggctl.sh <command>
+  AdminListen: "__YGG_ADMIN_SOCK_URI__"
+
+  IfName: "auto"
+  IfMTU: __YGG_IF_MTU__
+
+  # Do not advertise the platform, architecture and Yggdrasil version to the
+  # whole network.
+  NodeInfoPrivacy: true
+  NodeInfo: {
+    name: "YggTunnel"
+  }
+}

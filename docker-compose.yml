@@ -1,0 +1,153 @@
+# Server side of the tunnel.
+#
+#   shadowsocks (ssserver) ── shares the network namespace of ──> yggdrasil
+#
+# The node owns the namespace because it is the process that creates the TUN
+# device. ssserver joins it, binds to the node's Yggdrasil address
+# ([200:...::]:8388) and reaches the public internet through the container's
+# normal interface, so destinations see the server's public IP. That is also the
+# only layout that works: a Yggdrasil node does not route traffic to the
+# clearnet, it only exchanges traffic with other nodes, so the exit has to be a
+# process that speaks the clearnet itself.
+
+name: yggtunnel-server
+
+services:
+    yggdrasil:
+        build:
+            context: ./docker/yggdrasil
+            args:
+                YGG_VERSION: ${YGG_VERSION:-0.5.14}
+        image: yggtunnel/yggdrasil:${YGG_VERSION:-0.5.14}
+        container_name: yggt-server-yggdrasil
+        restart: unless-stopped
+        # Creating and configuring the TUN device with netlink, and nothing
+        # else: the node parses packets from every peer on the public network.
+        # Combined with read_only and no-new-privileges, a compromise is
+        # contained to the two volumes rather than reaching the host.
+        cap_drop:
+            - ALL
+        cap_add:
+            - NET_ADMIN
+        security_opt:
+            - no-new-privileges:true
+        read_only: true
+        # /run is where iptables keeps its lock file, which a read-only rootfs
+        # would not let it create.
+        tmpfs:
+            - /run
+            - /tmp
+        pids_limit: 256
+        mem_limit: 512m
+        # A hostile peer can make the node log a lot; without rotation that
+        # fills the disk of a container that restarts itself on failure.
+        logging:
+            driver: json-file
+            options:
+                max-size: "10m"
+                max-file: "3"
+        devices:
+            - /dev/net/tun:/dev/net/tun
+        environment:
+            YGG_STATE_DIR: /state
+            YGG_RUNTIME_DIR: /runtime
+            YGG_CONF_TEMPLATE: /etc/yggdrasil/yggdrasil.conf.template
+            # Required. An unset or empty group password would silently leave
+            # the Shadowsocks port reachable for the whole Yggdrasil network.
+            YGG_GROUP_PASSWORD: ${YGG_GROUP_PASSWORD:?YGG_GROUP_PASSWORD is not set in .env}
+            YGG_PEERS: ${YGG_PEERS:?YGG_PEERS is not set in .env}
+            YGG_IF_MTU: ${YGG_IF_MTU:-65535}
+            # The entrypoint restricts the Shadowsocks port on the TUN device to
+            # the node addresses in YGG_CLIENT_ADDR, with one ip6tables accept
+            # rule per address plus a drop rule for the rest. 'any' installs no
+            # rules, an empty value refuses to start. See .env.example.
+            #
+            # These two are set on the server only, because nothing of ours
+            # listens on the overlay on the client.
+            YGG_CLIENT_ADDR: ${YGG_CLIENT_ADDR:-}
+            YGG_SS_FILTER_PORT: ${SS_SERVER_PORT:-8388}
+        volumes:
+            # ygg-state is the node identity, the rendered config and the admin
+            # socket. Secrets: this volume must stay invisible to the
+            # Shadowsocks container.
+            - ygg-state:/state
+            # The discovered address and subnet, and nothing else.
+            - ygg-runtime:/runtime
+            # Overrides the template baked into the image, so that editing it in
+            # the repository takes effect on the next start.
+            - ./docker/yggdrasil/yggdrasil.conf.template:/etc/yggdrasil/yggdrasil.conf.template:ro
+        networks:
+            - yggnet
+        healthcheck:
+            # The entrypoint creates /runtime/address only after the TUN device
+            # actually carries the node address, and removes it again on every
+            # start, so this reflects the live state of the TUN. It is also what
+            # releases the Shadowsocks container, so it must not pass before the
+            # entrypoint has installed the port filter.
+            test: ["CMD-SHELL", "test -s /runtime/address"]
+            interval: 5s
+            timeout: 3s
+            retries: 60
+            start_period: 15s
+
+    shadowsocks:
+        image: ghcr.io/shadowsocks/ssserver-rust:${SS_IMAGE_TAG:-v1.25.0}
+        container_name: yggt-server-shadowsocks
+        restart: unless-stopped
+        # The upstream image declares no USER, so without this it would run as
+        # root. Nothing here needs privileges: the port is above 1024 and the
+        # TUN belongs to the other container.
+        #
+        # cap_drop: ALL and this user: line have to be kept together. The
+        # entrypoint passes `-a nobody` only when it is already root, because
+        # dropping privileges calls setgroups(), which needs CAP_SETGID. With
+        # ALL dropped, handing the flag to a process that is already
+        # unprivileged is not a no-op: ssserver logs "Operation not permitted"
+        # and exits 64, and the container just crash-loops looking healthy.
+        user: "65534:65534"
+        cap_drop:
+            - ALL
+        security_opt:
+            - no-new-privileges:true
+        read_only: true
+        tmpfs:
+            - /tmp
+        pids_limit: 256
+        logging:
+            driver: json-file
+            options:
+                max-size: "10m"
+                max-file: "3"
+        # Shares the namespace of the yggdrasil container, so it can bind to
+        # the node's Yggdrasil address. It must therefore not declare its own
+        # networks or ports.
+        network_mode: "container:yggt-server-yggdrasil"
+        environment:
+            SS_SERVER_PORT: ${SS_SERVER_PORT:-8388}
+            SS_PASSWORD: ${SS_PASSWORD:?SS_PASSWORD is not set in .env}
+            SS_METHOD: ${SS_METHOD:-aes-256-gcm}
+        volumes:
+            # Read-only, and deliberately NOT the state volume: this is only ever
+            # the discovered address. The node's private key and the rendered
+            # config live in ygg-state, which this container cannot see, so a
+            # flaw in a third-party image that parses untrusted network input
+            # does not hand over the node's identity.
+            - ygg-runtime:/runtime:ro
+            # ssserver resolves destination domains, and that has to happen on
+            # this side of the tunnel, so the resolver configuration is pinned
+            # here instead of relying on Docker's embedded DNS.
+            - ./config/resolv.conf:/etc/resolv.conf:ro
+            # Read as an argument to /bin/sh, so it does not need the
+            # executable bit on the host.
+            - ./docker/ssserver/entrypoint.sh:/opt/yggtunnel/entrypoint.sh:ro
+        depends_on:
+            yggdrasil:
+                condition: service_healthy
+        entrypoint: ["/bin/sh", "/opt/yggtunnel/entrypoint.sh"]
+
+networks:
+    yggnet: {}
+
+volumes:
+    ygg-state: {}
+    ygg-runtime: {}

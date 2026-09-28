@@ -1,0 +1,132 @@
+# Client side of the tunnel.
+#
+#   application ──> SOCKS5 127.0.0.1:1080 ──> sslocal ── shares the network
+#   namespace of ──> yggdrasil ──> Yggdrasil network ──> server ──> clearnet
+#
+# Same layout as on the server: sslocal joins the namespace of the Yggdrasil
+# container so that its outgoing traffic goes out through the TUN device, and
+# the SOCKS5 port is published on the yggdrasil container because that is the
+# container that owns the namespace.
+
+name: yggtunnel-client
+
+services:
+    yggdrasil:
+        build:
+            context: ./docker/yggdrasil
+            args:
+                YGG_VERSION: ${YGG_VERSION:-0.5.14}
+        image: yggtunnel/yggdrasil:${YGG_VERSION:-0.5.14}
+        container_name: yggt-client-yggdrasil
+        restart: unless-stopped
+        # Same reasoning as on the server. The entrypoint never runs ip6tables
+        # here, because nothing of ours listens on the overlay.
+        cap_drop:
+            - ALL
+        cap_add:
+            - NET_ADMIN
+        security_opt:
+            - no-new-privileges:true
+        read_only: true
+        tmpfs:
+            - /run
+            - /tmp
+        pids_limit: 256
+        mem_limit: 512m
+        logging:
+            driver: json-file
+            options:
+                max-size: "10m"
+                max-file: "3"
+        devices:
+            - /dev/net/tun:/dev/net/tun
+        environment:
+            YGG_STATE_DIR: /state
+            YGG_RUNTIME_DIR: /runtime
+            YGG_CONF_TEMPLATE: /etc/yggdrasil/yggdrasil.conf.template
+            # Must be the same value as on the server, otherwise the two nodes
+            # will peer fine but will not exchange any traffic.
+            YGG_GROUP_PASSWORD: ${YGG_GROUP_PASSWORD:?YGG_GROUP_PASSWORD is not set in .env}
+            YGG_PEERS: ${YGG_PEERS:?YGG_PEERS is not set in .env}
+            YGG_IF_MTU: ${YGG_IF_MTU:-65535}
+        volumes:
+            # ygg-client-state is the node identity, the rendered config and the
+            # admin socket. Secrets: this volume must stay invisible to the
+            # Shadowsocks container.
+            - ygg-client-state:/state
+            # The discovered address and subnet, and nothing else.
+            - ygg-client-runtime:/runtime
+            - ./docker/yggdrasil/yggdrasil.conf.template:/etc/yggdrasil/yggdrasil.conf.template:ro
+        networks:
+            - yggnet
+        # SOCKS5 for the applications on the host. Published here because this is
+        # the container that owns the network namespace sslocal runs in.
+        #
+        # SECURITY: SOCKS5 carries no authentication of its own. Publishing it
+        # without an IP prefix makes it reachable by every device on the local
+        # network, so the default binds to loopback. Replace the line below with
+        # "${SS_LOCAL_PORT}:${SS_LOCAL_PORT}" to allow access from other devices,
+        # and put a firewall in front of it.
+        #
+        # Do not also change the -b address in docker/sslocal/entrypoint.sh to
+        # "[::]": 0.0.0.0 is IPv4-only on purpose, and an IPv6 bind would put
+        # this unauthenticated proxy on the node's Yggdrasil address, i.e. in
+        # reach of the whole overlay.
+        ports:
+            - "127.0.0.1:${SS_LOCAL_PORT:-1080}:${SS_LOCAL_PORT:-1080}"
+        healthcheck:
+            test: ["CMD-SHELL", "test -s /runtime/address"]
+            interval: 5s
+            timeout: 3s
+            retries: 60
+            start_period: 15s
+
+    shadowsocks:
+        image: ghcr.io/shadowsocks/sslocal-rust:${SS_IMAGE_TAG:-v1.25.0}
+        container_name: yggt-client-shadowsocks
+        restart: unless-stopped
+        # The upstream image declares no USER, so without this it would run as
+        # root. Nothing here needs privileges: the SOCKS5 port is above 1024 and
+        # the TUN belongs to the other container.
+        #
+        # cap_drop: ALL and this user: line have to be kept together, for the
+        # setgroups()/CAP_SETGID reason spelled out in docker-compose.yml.
+        user: "65534:65534"
+        cap_drop:
+            - ALL
+        security_opt:
+            - no-new-privileges:true
+        read_only: true
+        tmpfs:
+            - /tmp
+        pids_limit: 256
+        logging:
+            driver: json-file
+            options:
+                max-size: "10m"
+                max-file: "3"
+        network_mode: "container:yggt-client-yggdrasil"
+        environment:
+            SS_LOCAL_PORT: ${SS_LOCAL_PORT:-1080}
+            SS_SERVER_PORT: ${SS_SERVER_PORT:-8388}
+            SS_PASSWORD: ${SS_PASSWORD:?SS_PASSWORD is not set in .env}
+            SS_METHOD: ${SS_METHOD:-aes-256-gcm}
+            YGG_SERVER_ADDR: ${YGG_SERVER_ADDR:?YGG_SERVER_ADDR is not set in .env, see ./scripts/get-server-address.sh}
+        volumes:
+            # Read-only, and deliberately NOT the state volume: this is only ever
+            # the discovered address. The node's private key and the rendered
+            # config live in ygg-client-state, which this container cannot see.
+            - ygg-client-runtime:/runtime:ro
+            - ./config/resolv.conf:/etc/resolv.conf:ro
+            - ./docker/sslocal/entrypoint.sh:/opt/yggtunnel/entrypoint.sh:ro
+        depends_on:
+            yggdrasil:
+                condition: service_healthy
+        entrypoint: ["/bin/sh", "/opt/yggtunnel/entrypoint.sh"]
+
+networks:
+    yggnet: {}
+
+volumes:
+    ygg-client-state: {}
+    ygg-client-runtime: {}
